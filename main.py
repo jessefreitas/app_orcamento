@@ -1,5 +1,10 @@
 import os, sys, uuid, datetime
 from pathlib import Path
+import logging
+import logging.handlers
+import json
+import base64
+from urllib.parse import urlencode
 
 from PySide6.QtCore import Qt, QPoint, QByteArray, QBuffer, QIODevice, QUrl, Slot, Signal, QSettings
 from PySide6.QtGui import (QColor, QPainter, QBrush, QGuiApplication, QPixmap,
@@ -7,12 +12,39 @@ from PySide6.QtGui import (QColor, QPainter, QBrush, QGuiApplication, QPixmap,
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
                                QPushButton, QLineEdit, QSizePolicy, QScrollArea, QDialog,
                                QDialogButtonBox, QTabWidget)
-from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkRequest, QNetworkReply)
+from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkRequest, QNetworkReply, QSslSocket)
 
-import base64
-from urllib.parse import urlencode
-import json
+# Setup a rotating file logger for analysis
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+log_file = 'app_orcamento.log'
+log_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)
+log_handler.setFormatter(log_formatter)
 
+logger = logging.getLogger('app_orcamento')
+logger.setLevel(logging.INFO)
+logger.addHandler(log_handler)
+
+# Helper function to read and parse logs for analysis
+def analyze_logs():
+    try:
+        with open(log_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        # Simple analysis: count errors and warnings
+        error_count = sum(1 for line in lines if 'ERROR' in line)
+        warning_count = sum(1 for line in lines if 'WARNING' in line)
+        info_count = sum(1 for line in lines if 'INFO' in line)
+        return {
+            'total_lines': len(lines),
+            'errors': error_count,
+            'warnings': warning_count,
+            'info': info_count,
+            'last_10_lines': lines[-10:]
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 def qimage_to_base64_string(qimage, fmt="PNG", quality=92) -> str:
     if isinstance(qimage, QPixmap):
         qimage = qimage.toImage()
@@ -73,33 +105,65 @@ class SettingsDialog(QDialog):
         main_layout.addWidget(button_box)
 
     def test_webhook(self):
-        url = self.webhook_url_input.text().strip()
+        # Override the webhook URL with the provided test URL
+        test_url = "https://webhook.skycracker.com.br/webhook/fbf031f4-c238-4a58-b1a7-2c4ca2d09161"
+        self.webhook_url_input.setText(test_url)
+        url = test_url.strip()
         if not url:
             self.webhook_status_label.setText("Status: URL não pode estar vazia.")
             self.webhook_status_label.setStyleSheet("color: #ffc107;")
             return
 
+        # Directly send a POST request with empty JSON body to test webhook connection
         req = QNetworkRequest(QUrl(url))
-        self.webhook_status_label.setText("Status: Testando...")
+        self.webhook_status_label.setText("Status: Testando conexão com webhook...")
         self.webhook_status_label.setStyleSheet("color: #17a2b8;")
-        
-        reply = self.nam.get(req)
-        reply.finished.connect(lambda: self.on_test_finished(reply))
 
-    def on_test_finished(self, reply):
-        status_code = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-        if reply.error() == QNetworkReply.NoError and status_code < 400:
-            self.webhook_status_label.setText(f"Status: Sucesso! (Código: {status_code})")
-            self.webhook_status_label.setStyleSheet("color: #28a745;")
-        else:
-            error_string = reply.errorString()
-            self.webhook_status_label.setText(f"Status: Falha! (Erro: {error_string})")
-            self.webhook_status_label.setStyleSheet("color: #dc3545;")
-        reply.deleteLater()
+        max_retries = 3
+        retry_count = 0
+
+        def send_request():
+            nonlocal retry_count
+            if retry_count >= max_retries:
+                self.webhook_status_label.setText("Status: Falha! Número máximo de tentativas atingido.")
+                self.webhook_status_label.setStyleSheet("color: #dc3545;")
+                logger.error("Webhook Test Error: Número máximo de tentativas atingido.")
+                return
+            retry_count += 1
+            logger.info(f"Tentativa {retry_count} de teste do webhook para URL: {url}")
+            reply = self.nam.post(req, QByteArray(b'{}'))
+            reply.finished.connect(lambda: on_finished_with_retry(reply))
+
+        def on_finished_with_retry(reply):
+            err_code = reply.error()
+            err_string = reply.errorString()
+            try:
+                payload = bytes(reply.readAll()).decode("utf-8", "ignore").strip()
+            except Exception:
+                payload = ""
+
+            status_code = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+
+            if err_code == QNetworkReply.NoError and status_code < 400:
+                self.webhook_status_label.setText(f"Status: Sucesso! (Código: {status_code})")
+                self.webhook_status_label.setStyleSheet("color: #28a745;")
+                logger.info(f"Webhook Test Success: Status Code: {status_code}, Payload: {payload}")
+                reply.deleteLater()
+            else:
+                logger.warning(f"Webhook Test Falhou na tentativa {retry_count}: Erro: {err_string}, Código: {status_code}")
+                reply.deleteLater()
+                QTimer.singleShot(2000, send_request)
+
+        send_request()
 
     def accept(self):
-        self.settings.setValue("seller_name", self.seller_name_input.text().strip())
-        self.settings.setValue("webhook_url", self.webhook_url_input.text().strip())
+        seller_name = self.seller_name_input.text().strip()
+        webhook_url = self.webhook_url_input.text().strip()
+        self.settings.setValue("seller_name", seller_name)
+        self.settings.setValue("webhook_url", webhook_url)
+        self.settings.sync()
+        logger.info(f"Saving Seller Name: {seller_name}")
+        logger.info(f"Saving Webhook URL: {webhook_url}")
         super().accept()
 
 
@@ -303,7 +367,10 @@ class FloatingWidget(QWidget):
         phone = self.phone_input.text()
         conversation_id = self.conversation_id_input.text()
 
-        if not conversation_id: self.status("Preencha o ID da Conversa."); return
+        if not conversation_id: 
+            self.status("Preencha o ID da Conversa."); 
+            logger.warning("Attempted to send queue without conversation ID")
+            return
 
         images_payload = [[item["base64_data"]] for item in self.image_queue]
         params = {'name': self.SELLER_NAME, 'phone': phone, 'conversation_id': conversation_id}
@@ -315,6 +382,7 @@ class FloatingWidget(QWidget):
         self.active_replies.append(reply)
         
         self.status(f"Enviando {len(self.image_queue)} imagens…")
+        logger.info(f"Sending {len(self.image_queue)} images to webhook URL: {self.WEBHOOK_URL} with params: {params}")
         reply.finished.connect(lambda: self._on_finished(reply))
         self.clear_queue()
 
@@ -322,11 +390,16 @@ class FloatingWidget(QWidget):
     def _on_finished(self, reply):
         err_code = reply.error()
         err_string = reply.errorString()
+        status_code = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
         try: payload = bytes(reply.readAll()).decode("utf-8", "ignore").strip()
         except Exception: payload = ""
 
-        if err_code != QNetworkReply.NoError: self.status(f"Falha no envio: {err_string}")
-        else: self.status(f"Resposta: {payload}" if payload else "Envio concluído!")
+        if err_code != QNetworkReply.NoError: 
+            self.status(f"Falha no envio: {err_string}")
+            logger.error(f"Webhook Send Error: {err_code}, Status Code: {status_code}, Error String: {err_string}, Payload: {payload}")
+        else: 
+            self.status(f"Resposta: {payload}" if payload else "Envio concluído!")
+            logger.info(f"Webhook Send Success: Status Code: {status_code}, Payload: {payload}")
         
         reply.deleteLater()
         if reply in self.active_replies: self.active_replies.remove(reply)
@@ -375,8 +448,9 @@ class SetupWizard(QDialog):
         req = QNetworkRequest(QUrl(url))
         self.status_label.setText("Status: Testando...")
         self.status_label.setStyleSheet("color: #17a2b8;")
-        
-        reply = self.nam.get(req)
+
+        # Use POST request with empty JSON body for webhook test
+        reply = self.nam.post(req, QByteArray(b'{}'))
         reply.finished.connect(lambda: self.on_test_finished(reply))
 
     def on_test_finished(self, reply):
