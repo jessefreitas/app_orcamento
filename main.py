@@ -5,17 +5,20 @@ from PySide6.QtCore import Qt, QPoint, QByteArray, QBuffer, QIODevice, QUrl, Slo
 from PySide6.QtGui import (QColor, QPainter, QBrush, QGuiApplication, QPixmap,
                            QShortcut, QKeySequence)
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
-                               QPushButton, QLineEdit)
-from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkRequest,
-                               QHttpMultiPart, QHttpPart)
+                               QPushButton, QLineEdit, QSizePolicy)
+from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkRequest, QNetworkReply)
 
 # ====== Configuração do webhook ======
 WEBHOOK_URL   = os.getenv("WEBHOOK_URL", "https://webhook.skycracker.com.br/webhook/fbf031f4-c238-4a58-b1a7-2c4ca2d09161")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")  # opcional, para header Authorization
 
 
-def qimage_to_bytes(qimage, fmt="PNG", quality=92) -> bytes:
-    """Converte QImage/QPixmap para bytes."""
+import base64
+from urllib.parse import urlencode
+import json
+
+def qimage_to_base64_string(qimage, fmt="PNG", quality=92) -> str:
+    """Converte QImage/QPixmap para string Base64."""
     if isinstance(qimage, QPixmap):
         qimage = qimage.toImage()
     ba = QByteArray()
@@ -23,81 +26,126 @@ def qimage_to_bytes(qimage, fmt="PNG", quality=92) -> bytes:
     buf.open(QIODevice.WriteOnly)
     qimage.save(buf, fmt, quality)
     buf.close()
-    return bytes(ba)
+    return base64.b64encode(bytes(ba)).decode("utf-8")
 
 
 class FloatingWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.image_queue = []
+        self.active_replies = []
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
             | Qt.Tool  # não aparece na barra de tarefas
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.resize(400, 300)
+        self.resize(500, 400)
         self._drag_pos = QPoint()
 
         # ====== UI ======
         container = QWidget(self)
         container.setObjectName("card")
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
         self.title = QLabel("OmniForge — App Flutuante")
         self.title.setStyleSheet("font-weight:600;")
+        self.title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         self.hint = QLabel("Cole uma imagem (Ctrl+V) ou arraste & solte arquivos aqui.")
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("opacity:0.9;")
+        self.hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Nome")
+        self.name_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.phone_input = QLineEdit()
         self.phone_input.setPlaceholderText("Telefone")
+        self.phone_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        form_layout = QHBoxLayout()
-        form_layout.addWidget(self.name_input)
-        form_layout.addWidget(self.phone_input)
+        form_widget = QWidget()
+        form_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        form_layout = QHBoxLayout(form_widget)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+        form_layout.setSpacing(10)
+        form_layout.addWidget(self.name_input, 1)
+        form_layout.addWidget(self.phone_input, 1)
 
         self.queue_lbl = QLabel("Fila: 0/10")
+        self.queue_lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.status_lbl = QLabel("Pronto.")
-        self.status_lbl.setStyleSheet("opacity:0.85;")
+        self.status_lbl.setObjectName("statusLabel") # Add object name for styling
+        self.status_lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed) # Fix status label height
 
         self.send_btn = QPushButton("Enviar Fila")
+        self.send_btn.setObjectName("sendButton") # Add object name for styling
         self.send_btn.clicked.connect(self.send_queue)
         btn_close = QPushButton("Fechar")
         btn_close.clicked.connect(self.close)
 
         btn_layout = QHBoxLayout()
-        btn_layout.addWidget(self.send_btn)
         btn_layout.addStretch()
+        btn_layout.addWidget(self.send_btn)
+        btn_layout.addSpacing(10)
         btn_layout.addWidget(btn_close)
 
         layout.addWidget(self.title)
-        layout.addWidget(self.hint)
-        layout.addLayout(form_layout)
-        layout.addStretch()
+        layout.addWidget(self.hint, 1)
+        layout.addWidget(form_widget, 1)
         layout.addWidget(self.queue_lbl)
         layout.addWidget(self.status_lbl)
         layout.addLayout(btn_layout)
+        layout.addStretch()
 
         self.setStyleSheet('''
             QWidget#card {
-                background: rgba(20,20,28,210);
-                color: #f6f6f6;
+                background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, stop:0 rgba(40, 44, 52, 230), stop:1 rgba(20, 22, 26, 240));
+                color: #f0f0f0;
                 border-radius: 14px;
+                border: 1px solid rgba(120, 120, 120, 60);
+            }
+            QLabel {
+                color: #e0e0e0;
+            }
+            QLineEdit {
+                padding: 10px;
+                border: 1px solid #444;
+                border-radius: 8px;
+                background: rgba(0,0,0,0.3);
+                color: #f0f0f0;
+                font-size: 14px;
+            }
+            QLineEdit:focus {
+                border: 1px solid #7a63ff;
+                background: rgba(0,0,0,0.2);
             }
             QPushButton {
-                padding: 6px 10px; border: 1px solid #666; border-radius: 8px;
-                background: transparent; color: #f6f6f6;
+                padding: 8px 14px;
+                border: 1px solid #555;
+                border-radius: 8px;
+                background: transparent;
+                color: #e0e0e0;
+                font-weight: 600;
             }
-            QPushButton:hover { background: rgba(255,255,255,0.08); }
-            QLineEdit {
-                padding: 6px 10px; border: 1px solid #666; border-radius: 8px;
-                background: rgba(0,0,0,0.2); color: #f6f6f6;
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.08);
+                border-color: #888;
+            }
+            QPushButton#sendButton {
+                background-color: #7a63ff;
+                border-color: #7a63ff;
+                color: #ffffff;
+            }
+            QPushButton#sendButton:hover {
+                background-color: #8b74ff;
+            }
+            QLabel#statusLabel {
+                color: #90ee90; /* Light green for success/response */
+                font-weight: 600;
             }
         ''')
 
@@ -108,14 +156,11 @@ class FloatingWidget(QWidget):
         # ====== HTTP Client ======
         self.nam = QNetworkAccessManager(self)
 
-    # ---------- Aparência ----------
+    # ---------- Aparência (Sombra) ----------
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        for i, alpha in enumerate((40, 25, 15, 8)):
-            painter.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-            painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(self.rect().adjusted(i, i, -i, -i), 16, 16)
+        # A sombra agora é controlada pelo QWidget#card border e o fundo gradiente.
+        # O paintEvent customizado para sombra pode ser removido para simplificar.
+        super().paintEvent(event)
 
     # ---------- Arrastar janela ----------
     def mousePressEvent(self, event):
@@ -160,18 +205,15 @@ class FloatingWidget(QWidget):
             event.ignore()
             return
 
-        # 1) Imagem embutida
         if md.hasImage():
             img = md.imageData()
             self.enqueue_image(img)
             handled = True
 
-        # 2) Arquivos (URLs)
         if md.hasUrls():
             for url in md.urls():
                 local = url.toLocalFile()
-                if not local:
-                    continue
+                if not local: continue
                 p = Path(local)
                 if p.is_file():
                     pix = QPixmap(str(p))
@@ -195,14 +237,12 @@ class FloatingWidget(QWidget):
         cb = QGuiApplication.clipboard()
         md = cb.mimeData()
 
-        # 1) Se tiver imagem direta
         img = cb.image()
         if not img.isNull():
             self.enqueue_image(img)
             self.hint.setText("Cole uma imagem (Ctrl+V) ou arraste & solte arquivos aqui.")
             return
 
-        # 2) Se for arquivo copiado (paths em URLs)
         if md.hasUrls():
             for url in md.urls():
                 p = Path(url.toLocalFile())
@@ -227,16 +267,17 @@ class FloatingWidget(QWidget):
 
         ext = Path(filename).suffix.lower()
         fmt = "PNG" if ext not in (".jpg", ".jpeg") else "JPG"
-        mime = "image/png" if fmt == "PNG" else "image/jpeg"
-
-        data = qimage_to_bytes(qimg_or_pix, fmt=fmt, quality=92)
-        self.image_queue.append({"filename": filename, "data": data, "mime": mime})
+        
+        base64_string = qimage_to_base64_string(qimg_or_pix, fmt=fmt, quality=92)
+        self.image_queue.append({"filename": filename, "base64_data": base64_string})
         self.update_queue_label()
         self.status(f"Imagem '{filename}' adicionada à fila.")
 
     def send_queue(self):
+        print("[DEBUG] Iniciando send_queue...")
         if not self.image_queue:
             self.status("Fila de envio vazia.")
+            print("[DEBUG] Fila vazia. Abortando.")
             return
 
         name = self.name_input.text()
@@ -244,69 +285,67 @@ class FloatingWidget(QWidget):
 
         if not name or not phone:
             self.status("Por favor, preencha o nome e o telefone.")
+            print(f"[DEBUG] Nome ou telefone não preenchido. Nome: '{name}', Telefone: '{phone}'. Abortando.")
             return
 
-        for item in self.image_queue:
-            self.upload_bytes(item["filename"], item["data"], item["mime"], name, phone)
-
-        self.image_queue.clear()
-        self.update_queue_label()
-
-    def upload_bytes(self, filename: str, data: bytes, mime: str, name: str, phone: str):
         if not WEBHOOK_URL:
             self.status("WEBHOOK_URL não configurada.")
+            print("[DEBUG] WEBHOOK_URL não configurada. Abortando.")
             return
 
-        url = QUrl(WEBHOOK_URL)
+        print("[DEBUG] Preparando payload...")
+        images_payload = [[item["base64_data"]] for item in self.image_queue]
+        json_payload = json.dumps(images_payload)
+
+        params = {'name': name, 'phone': phone}
+        encoded_params = urlencode(params)
+        full_url = f"{WEBHOOK_URL}?{encoded_params}"
+
+        print(f"[DEBUG] URL de destino: {full_url}")
+        # print(f"[DEBUG] Payload JSON: {json_payload[:200]}...") # Descomente para ver o payload
+
+        url = QUrl(full_url)
         req = QNetworkRequest(url)
         req.setHeader(QNetworkRequest.UserAgentHeader, "OmniForge-FloatApp/1.0")
         if WEBHOOK_TOKEN:
             req.setRawHeader(b"Authorization", f"Bearer {WEBHOOK_TOKEN}".encode())
+        
+        req.setHeader(QNetworkRequest.ContentTypeHeader, 'application/json')
 
-        mp = QHttpMultiPart(QHttpMultiPart.FormDataType)
+        print("[DEBUG] Enviando requisição POST...")
+        reply = self.nam.post(req, json_payload.encode("utf-8"))
+        self.active_replies.append(reply) # Manter referência da requisição
 
-        # Dados do formulário (nome, telefone)
-        name_part = QHttpPart()
-        name_part.setHeader(QNetworkRequest.ContentDispositionHeader, 'form-data; name="name"')
-        name_part.setBody(name.encode("utf-8"))
+        self.status(f"Enviando {len(self.image_queue)} imagens…")
+        reply.finished.connect(lambda: self._on_finished(reply))
 
-        phone_part = QHttpPart()
-        phone_part.setHeader(QNetworkRequest.ContentDispositionHeader, 'form-data; name="phone"')
-        phone_part.setBody(phone.encode("utf-8"))
-
-        # Arquivo
-        file_part = QHttpPart()
-        disp = f'form-data; name="file"; filename="{filename}"'
-        file_part.setHeader(QNetworkRequest.ContentDispositionHeader, disp)
-        file_part.setHeader(QNetworkRequest.ContentTypeHeader, mime)
-        buf = QBuffer()
-        buf.setData(QByteArray(data))
-        buf.open(QIODevice.ReadOnly)
-        file_part.setBodyDevice(buf)
-        buf.setParent(mp)
-
-        mp.append(name_part)
-        mp.append(phone_part)
-        mp.append(file_part)
-
-        reply = self.nam.post(req, mp)
-        mp.setParent(reply)
-
-        self.status(f"Enviando: {filename} …")
-        reply.finished.connect(lambda: self._on_finished(reply, filename))
+        self.image_queue.clear()
+        self.update_queue_label()
 
     @Slot()
-    def _on_finished(self, reply, filename: str):
-        err = reply.error()
+    def _on_finished(self, reply):
+        err_code = reply.error()
+        err_string = reply.errorString()
+        print(f"[DEBUG] Requisição finalizada. Código de erro: {err_code} ({err_string})")
+        
         try:
-            payload = bytes(reply.readAll()).decode("utf-8", "ignore")
-        except Exception:
-            payload = "<sem corpo>"
-        if err:
-            self.status(f"Falha no envio de {filename}: {reply.errorString()}")
+            payload = bytes(reply.readAll()).decode("utf-8", "ignore").strip()
+            print(f"[DEBUG] Resposta recebida (payload): {payload}")
+        except Exception as e:
+            payload = "<erro ao ler payload>"
+            print(f"[DEBUG] Erro ao decodificar resposta: {e}")
+
+        if err_code != QNetworkReply.NoError:
+            self.status(f"Falha no envio: {err_string}")
         else:
-            self.status(f"Envio de {filename} concluído.")
+            if payload:
+                self.status(f"Resposta: {payload}")
+            else:
+                self.status("Envio concluído, sem resposta do servidor.")
+        
         reply.deleteLater()
+        if reply in self.active_replies:
+            self.active_replies.remove(reply) # Remover referência da requisição
 
     def update_queue_label(self):
         self.queue_lbl.setText(f"Fila: {len(self.image_queue)}/10")
