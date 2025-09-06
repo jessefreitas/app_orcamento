@@ -6,7 +6,7 @@ from PySide6.QtGui import (QColor, QPainter, QBrush, QGuiApplication, QPixmap,
                            QShortcut, QKeySequence, QIcon)
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
                                QPushButton, QLineEdit, QSizePolicy, QScrollArea, QDialog,
-                               QDialogButtonBox)
+                               QDialogButtonBox, QTabWidget)
 from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkRequest, QNetworkReply)
 
 import base64
@@ -28,28 +28,74 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configurações")
-        self.setMinimumWidth(400)
-
+        self.setMinimumWidth(450)
         self.settings = QSettings("OmniForge", "AppOrcamento")
+        self.nam = QNetworkAccessManager(self)
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(15)
+        main_layout = QVBoxLayout(self)
+        tab_widget = QTabWidget()
+        main_layout.addWidget(tab_widget)
 
+        # General Tab
+        general_tab = QWidget()
+        general_layout = QVBoxLayout(general_tab)
         self.seller_name_input = QLineEdit()
         self.seller_name_input.setText(self.settings.value("seller_name", ""))
-        
+        general_layout.addWidget(QLabel("Nome do Vendedor:"))
+        general_layout.addWidget(self.seller_name_input)
+        general_layout.addStretch()
+        tab_widget.addTab(general_tab, "Geral")
+
+        # Webhook Tab
+        webhook_tab = QWidget()
+        webhook_layout = QVBoxLayout(webhook_tab)
         self.webhook_url_input = QLineEdit()
         self.webhook_url_input.setText(self.settings.value("webhook_url", ""))
+        test_btn = QPushButton("Testar Conexão")
+        test_btn.clicked.connect(self.test_webhook)
+        self.webhook_status_label = QLabel("Status: N/A")
+        
+        webhook_layout.addWidget(QLabel("URL do Webhook:"))
+        webhook_layout.addWidget(self.webhook_url_input)
+        
+        hbox = QHBoxLayout()
+        hbox.addWidget(test_btn)
+        hbox.addStretch()
+        webhook_layout.addLayout(hbox)
+        webhook_layout.addWidget(self.webhook_status_label)
+        webhook_layout.addStretch()
+        tab_widget.addTab(webhook_tab, "Webhook")
 
-        layout.addWidget(QLabel("Nome do Vendedor:"))
-        layout.addWidget(self.seller_name_input)
-        layout.addWidget(QLabel("URL do Webhook:"))
-        layout.addWidget(self.webhook_url_input)
-
+        # Buttons
         button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
+        main_layout.addWidget(button_box)
+
+    def test_webhook(self):
+        url = self.webhook_url_input.text().strip()
+        if not url:
+            self.webhook_status_label.setText("Status: URL não pode estar vazia.")
+            self.webhook_status_label.setStyleSheet("color: #ffc107;")
+            return
+
+        req = QNetworkRequest(QUrl(url))
+        self.webhook_status_label.setText("Status: Testando...")
+        self.webhook_status_label.setStyleSheet("color: #17a2b8;")
+        
+        reply = self.nam.get(req)
+        reply.finished.connect(lambda: self.on_test_finished(reply))
+
+    def on_test_finished(self, reply):
+        status_code = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        if reply.error() == QNetworkReply.NoError and status_code < 400:
+            self.webhook_status_label.setText(f"Status: Sucesso! (Código: {status_code})")
+            self.webhook_status_label.setStyleSheet("color: #28a745;")
+        else:
+            error_string = reply.errorString()
+            self.webhook_status_label.setText(f"Status: Falha! (Erro: {error_string})")
+            self.webhook_status_label.setStyleSheet("color: #dc3545;")
+        reply.deleteLater()
 
     def accept(self):
         self.settings.setValue("seller_name", self.seller_name_input.text().strip())
@@ -157,10 +203,24 @@ class FloatingWidget(QWidget):
         layout.addWidget(self.status_lbl)
         layout.addLayout(btn_layout)
 
-        self.load_settings()
         self.setAcceptDrops(True)
         QShortcut(QKeySequence.Paste, self, activated=self.handle_paste)
         self.nam = QNetworkAccessManager(self)
+
+        # Load settings and check for first run
+        self.load_settings()
+        if self.settings.value("first_run", "true") == "true":
+            self.run_setup_wizard()
+
+    def run_setup_wizard(self):
+        wizard = SetupWizard(self)
+        if wizard.exec():
+            self.settings.setValue("first_run", "false")
+            self.load_settings()
+            self.status("Configuração inicial concluída.")
+        else:
+            # If the user cancels the wizard, close the application
+            self.close()
 
     def open_settings(self):
         dialog = SettingsDialog(self)
@@ -276,6 +336,78 @@ class FloatingWidget(QWidget):
 
     def status(self, text: str):
         self.status_lbl.setText(text)
+
+class SetupWizard(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Assistente de Configuração Inicial")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+        self.settings = QSettings("OmniForge", "AppOrcamento")
+        self.nam = QNetworkAccessManager(self)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Bem-vindo! Por favor, configure o webhook para continuar."))
+        
+        self.webhook_url_input = QLineEdit()
+        self.webhook_url_input.setPlaceholderText("https://seu-webhook.com/endpoint")
+        layout.addWidget(QLabel("URL do Webhook:"))
+        layout.addWidget(self.webhook_url_input)
+
+        test_btn = QPushButton("Testar e Salvar")
+        test_btn.clicked.connect(self.test_and_save)
+        self.status_label = QLabel("Status: Aguardando configuração.")
+        
+        layout.addWidget(test_btn)
+        layout.addWidget(self.status_label)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def test_and_save(self):
+        url = self.webhook_url_input.text().strip()
+        if not url:
+            self.status_label.setText("Status: URL não pode estar vazia.")
+            self.status_label.setStyleSheet("color: #ffc107;")
+            return
+
+        req = QNetworkRequest(QUrl(url))
+        self.status_label.setText("Status: Testando...")
+        self.status_label.setStyleSheet("color: #17a2b8;")
+        
+        reply = self.nam.get(req)
+        reply.finished.connect(lambda: self.on_test_finished(reply))
+
+    def on_test_finished(self, reply):
+        status_code = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        if reply.error() == QNetworkReply.NoError and status_code < 400:
+            self.status_label.setText(f"Status: Sucesso! (Código: {status_code})")
+            self.status_label.setStyleSheet("color: #28a745;")
+            self.settings.setValue("webhook_url", self.webhook_url_input.text().strip())
+            # Ask for seller name
+            self.prompt_for_seller_name()
+        else:
+            error_string = reply.errorString()
+            self.status_label.setText(f"Status: Falha! (Erro: {error_string})")
+            self.status_label.setStyleSheet("color: #dc3545;")
+        reply.deleteLater()
+
+    def prompt_for_seller_name(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Nome do Vendedor")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Por favor, insira o nome do vendedor:"))
+        seller_name_input = QLineEdit()
+        layout.addWidget(seller_name_input)
+        
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+        
+        if dialog.exec():
+            self.settings.setValue("seller_name", seller_name_input.text().strip())
+            self.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
